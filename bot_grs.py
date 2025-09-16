@@ -5,33 +5,29 @@ from openai import OpenAI
 import requests
 
 # ---------------------------------------------------------
-# 🔑 Настройка логирования
+# 🔑 Логирование
 # ---------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("grs-tg-bot")
 
 # ---------------------------------------------------------
-# 🔑 Вспомогательная функция: проверка переменных окружения
+# 🔑 Вспомогательная функция для переменных окружения
 # ---------------------------------------------------------
 def need(name: str) -> str:
-    """Берёт переменную окружения или падает с ошибкой"""
     value = os.getenv(name)
     if not value:
-        raise RuntimeError(
-            f"Не задана переменная окружения {name}. "
-            f"Локально — укажи её в .env, на Railway — в Variables."
-        )
+        raise RuntimeError(f"Не задана переменная окружения {name}")
     return value
 
 # ---------------------------------------------------------
-# 🔑 Чтение ключей
+# 🔑 Ключи и токены
 # ---------------------------------------------------------
 TELEGRAM_TOKEN = need("TELEGRAM_TOKEN")
 OPENAI_API_KEY = need("OPENAI_API_KEY")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 # ---------------------------------------------------------
-# 🔑 Инициализация клиентов
+# 🔑 Клиенты
 # ---------------------------------------------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = Flask(__name__)
@@ -40,13 +36,23 @@ app = Flask(__name__)
 # 📤 Отправка сообщений в Telegram
 # ---------------------------------------------------------
 def send_message(chat_id: int, text: str):
+    """
+    Отправляет сообщение пользователю.
+    Если сообщение > 4096 символов, делим на части.
+    """
+    MAX_LEN = 4096
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
 
-    r = requests.post(url, json=payload)
-    if not r.ok:
-        log.error(f"Ошибка отправки: {r.text}")
-    return r.json()
+    # делим длинный текст на куски
+    chunks = [text[i:i + MAX_LEN] for i in range(0, len(text), MAX_LEN)]
+
+    for chunk in chunks:
+        payload = {"chat_id": chat_id, "text": chunk}
+        r = requests.post(url, json=payload)
+        if not r.ok:
+            log.error(f"Ошибка отправки: {r.text}")
+        else:
+            log.info(f"Отправлено сообщение длиной {len(chunk)} символов")
 
 # ---------------------------------------------------------
 # 📥 Обработчик вебхука
@@ -64,7 +70,7 @@ def webhook():
     chat_id = message["chat"]["id"]
     chat_type = message["chat"]["type"]
 
-    # отвечаем только в приватных чатах
+    # ⚠️ фильтр — отвечаем только в приватных чатах
     if chat_type != "private":
         log.info(f"Ignored update from chat_type={chat_type}, id={chat_id}")
         return "OK"
@@ -79,35 +85,27 @@ def webhook():
         response = client.chat.completions.create(
             model="gpt-5-mini",
             messages=[{"role": "user", "content": user_text}],
-            max_completion_tokens=500
+            max_completion_tokens=2000,   # ✅ увеличенный лимит
+            temperature=0.7               # ✅ живость ответов
         )
 
-        # 🔎 Логируем весь ответ OpenAI (для отладки)
         log.info(f"OpenAI raw response: {response}")
 
         reply_text = None
         if response.choices:
             choice = response.choices[0]
+            if choice.message:
+                reply_text = getattr(choice.message, "content", None)
 
-            # вариант 1: message как dict
-            if hasattr(choice, "message") and choice.message:
-                if isinstance(choice.message, dict):
-                    reply_text = choice.message.get("content")
-                else:
-                    reply_text = getattr(choice.message, "content", None)
-
-            # вариант 2: text напрямую
-            if not reply_text and hasattr(choice, "text"):
-                reply_text = choice.text
-
-        if not reply_text:
-            log.error(f"Не удалось достать текст из ответа OpenAI: {response}")
-            reply_text = "Извините, я не смог сгенерировать ответ."
+        if not reply_text or reply_text.strip() == "":
+            log.error(f"Пустой ответ от OpenAI: {response}")
+            reply_text = "Извините, ответ пустой. Попробуйте ещё раз."
 
     except Exception as e:
         log.error(f"Ошибка OpenAI: {e}")
         reply_text = "Извините, что-то пошло не так."
 
+    # отправляем ответ (с разбиением, если длинный)
     send_message(chat_id, reply_text)
     return "OK", 200
 
