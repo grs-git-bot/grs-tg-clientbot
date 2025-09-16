@@ -1,117 +1,156 @@
 import os
 import logging
+import json
+import requests
 from flask import Flask, request
 from openai import OpenAI
-import requests
 
-# ---------------------------------------------------------
-# 🔑 Логирование
-# ---------------------------------------------------------
+# ----------------------------------------
+# 🔹 Логирование
+# ----------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("grs-tg-bot")
 
-# ---------------------------------------------------------
-# 🔑 Вспомогательная функция для переменных окружения
-# ---------------------------------------------------------
-def need(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Не задана переменная окружения {name}")
-    return value
+# ----------------------------------------
+# 🔹 Переменные окружения
+# ----------------------------------------
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+PORT = int(os.getenv("PORT", 8080))
 
-# ---------------------------------------------------------
-# 🔑 Ключи и токены
-# ---------------------------------------------------------
-TELEGRAM_TOKEN = need("TELEGRAM_TOKEN")
-OPENAI_API_KEY = need("OPENAI_API_KEY")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_TOKEN")
+if not os.getenv("OPENAI_API_KEY"):
+    raise RuntimeError("Не задан OPENAI_API_KEY")
+if not TAVILY_API_KEY:
+    log.warning("⚠️ Не задан TAVILY_API_KEY — поиск не будет работать")
 
-# ---------------------------------------------------------
-# 🔑 Клиенты
-# ---------------------------------------------------------
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ----------------------------------------
+# 🔹 Flask
+# ----------------------------------------
 app = Flask(__name__)
 
-# ---------------------------------------------------------
+# ----------------------------------------
 # 📤 Отправка сообщений в Telegram
-# ---------------------------------------------------------
+# ----------------------------------------
 def send_message(chat_id: int, text: str):
-    """
-    Отправляет сообщение пользователю.
-    Если сообщение > 4096 символов, делим на части.
-    """
-    MAX_LEN = 4096
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    r = requests.post(url, json=payload)
+    if not r.ok:
+        log.error(f"Ошибка Telegram API: {r.text}")
 
-    # делим длинный текст на куски
-    chunks = [text[i:i + MAX_LEN] for i in range(0, len(text), MAX_LEN)]
+# ----------------------------------------
+# 🔎 Функция поиска через Tavily
+# ----------------------------------------
+def web_search(query: str) -> str:
+    url = "https://api.tavily.com/search"
+    headers = {"Authorization": f"Bearer {TAVILY_API_KEY}"}
+    payload = {"query": query, "num_results": 3}
+    resp = requests.post(url, headers=headers, json=payload)
+    if resp.status_code != 200:
+        log.error(f"Ошибка Tavily API: {resp.text}")
+        return "Ошибка при поиске"
+    data = resp.json()
+    results = [item["content"] for item in data.get("results", [])]
+    return "\n".join(results) if results else "Нет результатов"
 
-    for chunk in chunks:
-        payload = {"chat_id": chat_id, "text": chunk}
-        r = requests.post(url, json=payload)
-        if not r.ok:
-            log.error(f"Ошибка отправки: {r.text}")
-        else:
-            log.info(f"Отправлено сообщение длиной {len(chunk)} символов")
-
-# ---------------------------------------------------------
-# 📥 Обработчик вебхука
-# ---------------------------------------------------------
+# ----------------------------------------
+# 📥 Webhook
+# ----------------------------------------
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
-    update = request.get_json(force=True)
-    if not update:
-        return "OK"
-
+    update = request.json
     message = update.get("message")
     if not message:
-        return "OK"
+        return "ok"
 
     chat_id = message["chat"]["id"]
     chat_type = message["chat"]["type"]
-
-    # ⚠️ фильтр — отвечаем только в приватных чатах
-    if chat_type != "private":
-        log.info(f"Ignored update from chat_type={chat_type}, id={chat_id}")
-        return "OK"
-
     user_text = message.get("text", "")
-    if not user_text:
-        return "OK"
+
+    if chat_type != "private":
+        return "ok"
+    if not user_text.strip():
+        return "ok"
 
     log.info(f"User {chat_id} wrote: {user_text}")
 
+    system_prompt = (
+        "Ты — эксперт-консультант компании Global Relocation Solutions (GRS). "
+        "Твоя специализация — миграционное право и программы ВНЖ/гражданства. "
+        "Отвечай профессионально и по делу, как юрист-практик. "
+        "Если требуется актуальная информация, используй встроенный поиск."
+    )
+
     try:
+        # Первый запрос
         response = client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[{"role": "user", "content": user_text}],
-            max_completion_tokens=2000,   # ✅ увеличенный лимит
-            #temperature=0.7               # ✅ живость ответов
+            model="gpt-4.1",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Поиск свежей информации в интернете",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"}
+                            },
+                            "required": ["query"],
+                        },
+                    }
+                }
+            ],
+            tool_choice="auto",
+            max_completion_tokens=800,
         )
 
-        log.info(f"OpenAI raw response: {response}")
+        choice = response.choices[0]
 
-        reply_text = None
-        if response.choices:
-            choice = response.choices[0]
-            if choice.message:
-                reply_text = getattr(choice.message, "content", None)
+        # Если модель решила вызвать web_search
+        if choice.message.tool_calls:
+            for tool_call in choice.message.tool_calls:
+                if tool_call.function.name == "web_search":
+                    args = json.loads(tool_call.function.arguments)
+                    query = args.get("query")
+                    search_result = web_search(query)
 
-        if not reply_text or reply_text.strip() == "":
-            log.error(f"Пустой ответ от OpenAI: {response}")
-            reply_text = "Извините, ответ пустой. Попробуйте ещё раз."
+                    # Второй запрос — модель получает результаты поиска
+                    response = client.chat.completions.create(
+                        model="gpt-4.1",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_text},
+                            choice.message,
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": search_result,
+                            },
+                        ],
+                        max_completion_tokens=1000,
+                    )
+
+        reply_text = response.choices[0].message.content.strip()
+        if not reply_text:
+            reply_text = "Извините, я не нашёл ответа."
 
     except Exception as e:
         log.error(f"Ошибка OpenAI: {e}")
-        reply_text = "Извините, что-то пошло не так."
+        reply_text = "Извините, произошла ошибка."
 
-    # отправляем ответ (с разбиением, если длинный)
     send_message(chat_id, reply_text)
-    return "OK", 200
+    return "ok"
 
-# ---------------------------------------------------------
+# ----------------------------------------
 # 🚀 Локальный запуск
-# ---------------------------------------------------------
+# ----------------------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)
