@@ -75,16 +75,22 @@ def webhook():
 
     log.info(f"User {chat_id} wrote: {user_text}")
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-5-mini", # пример модели
-            messages=[{"role": "user", "content": user_text}],
-            max_completion_tokens=1500
-        )
-        reply_text = response.choices[0].message.content
-    except Exception as e:
-        log.error(f"Ошибка OpenAI: {e}")
-        reply_text = "Извините, что-то пошло не так."
+   try:
+    response = client.chat.completions.create(
+        model="gpt-5-mini",
+        messages=[{"role": "user", "content": user_text}],
+        max_completion_tokens=1000
+    )
+
+    # безопасно достаём текст ответа
+    if response.choices and response.choices[0].message:
+        reply_text = response.choices[0].message.content or "Извините, я не смог сгенерировать ответ."
+    else:
+        reply_text = "Извините, я не смог сгенерировать ответ."
+
+except Exception as e:
+    log.error(f"Ошибка OpenAI: {e}")
+    reply_text = "Извините, что-то пошло не так."
 
     send_message(chat_id, reply_text)
     return "OK", 200
