@@ -79,7 +79,7 @@ def webhook():
         response = client.chat.completions.create(
             model="gpt-5-mini", # пример модели
             messages=[{"role": "user", "content": user_text}],
-            max_tokens=500
+            max_completion_tokens=1500
         )
         reply_text = response.choices[0].message.content
     except Exception as e:
