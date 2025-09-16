@@ -86,7 +86,7 @@ def webhook():
             model="gpt-5-mini",
             messages=[{"role": "user", "content": user_text}],
             max_completion_tokens=2000,   # ✅ увеличенный лимит
-            temperature=0.7               # ✅ живость ответов
+            #temperature=0.7               # ✅ живость ответов
         )
 
         log.info(f"OpenAI raw response: {response}")
