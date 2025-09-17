@@ -1,156 +1,185 @@
 import os
 import logging
-import json
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request
 from openai import OpenAI
 
-# ----------------------------------------
-# 🔹 Логирование
-# ----------------------------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("grs-tg-bot")
+# ---------------------------------------------
+# Логирование
+# ---------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logger = logging.getLogger("grs-tg-bot")
 
-# ----------------------------------------
-# 🔹 Переменные окружения
-# ----------------------------------------
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-PORT = int(os.getenv("PORT", 8080))
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Не задан TELEGRAM_TOKEN")
-if not os.getenv("OPENAI_API_KEY"):
-    raise RuntimeError("Не задан OPENAI_API_KEY")
-if not TAVILY_API_KEY:
-    log.warning("⚠️ Не задан TAVILY_API_KEY — поиск не будет работать")
-
-# ----------------------------------------
-# 🔹 Flask
-# ----------------------------------------
+# ---------------------------------------------
+# Flask приложение
+# ---------------------------------------------
 app = Flask(__name__)
 
-# ----------------------------------------
-# 📤 Отправка сообщений в Telegram
-# ----------------------------------------
-def send_message(chat_id: int, text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    r = requests.post(url, json=payload)
-    if not r.ok:
-        log.error(f"Ошибка Telegram API: {r.text}")
+# ---------------------------------------------
+# Ключи и токены
+# ---------------------------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ----------------------------------------
-# 🔎 Функция поиска через Tavily
-# ----------------------------------------
-def web_search(query: str) -> str:
-    url = "https://api.tavily.com/search"
-    headers = {"Authorization": f"Bearer {TAVILY_API_KEY}"}
-    payload = {"query": query, "num_results": 3}
-    resp = requests.post(url, headers=headers, json=payload)
-    if resp.status_code != 200:
-        log.error(f"Ошибка Tavily API: {resp.text}")
-        return "Ошибка при поиске"
-    data = resp.json()
-    results = [item["content"] for item in data.get("results", [])]
-    return "\n".join(results) if results else "Нет результатов"
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ----------------------------------------
-# 📥 Webhook
-# ----------------------------------------
-@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
-def webhook():
-    update = request.json
-    message = update.get("message")
-    if not message:
-        return "ok"
+# ---------------------------------------------
+# Функция инициализации базы
+# ---------------------------------------------
+def init_db():
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                role VARCHAR(16) NOT NULL CHECK (role IN ('user','assistant','system')),
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS chat_history_chat_created_idx
+            ON chat_history (chat_id, created_at DESC);
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("База инициализирована успешно ✅")
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации базы: {e}")
 
-    chat_id = message["chat"]["id"]
-    chat_type = message["chat"]["type"]
-    user_text = message.get("text", "")
+# ---------------------------------------------
+# Сохранение сообщения в БД
+# ---------------------------------------------
+def save_message(chat_id, role, content):
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO chat_history (chat_id, role, content) VALUES (%s, %s, %s)",
+            (chat_id, role, content)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка сохранения сообщения: {e}")
 
-    if chat_type != "private":
-        return "ok"
-    if not user_text.strip():
-        return "ok"
+# ---------------------------------------------
+# Загрузка последних сообщений из БД
+# ---------------------------------------------
+def load_history(chat_id, limit=20):
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, content FROM chat_history WHERE chat_id = %s ORDER BY created_at DESC LIMIT %s",
+            (chat_id, limit)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return list(reversed(rows))  # от старых к новым
+    except Exception as e:
+        logger.error(f"Ошибка загрузки истории: {e}")
+        return []
 
-    log.info(f"User {chat_id} wrote: {user_text}")
+# ---------------------------------------------
+# Запрос к Tavily API (поиск)
+# ---------------------------------------------
+def tavily_search(query):
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+            json={"query": query, "num_results": 3}
+        )
+        data = resp.json()
+        if "results" in data:
+            return "\n".join([r["content"] for r in data["results"]])
+        return None
+    except Exception as e:
+        logger.error(f"Tavily error: {e}")
+        return None
 
-    system_prompt = (
-        "Ты — эксперт-консультант компании Global Relocation Solutions (GRS). "
-        "Твоя специализация — миграционное право и программы ВНЖ/гражданства. "
-        "Отвечай профессионально и по делу, как юрист-практик. "
-        "Если требуется актуальная информация, используй встроенный поиск."
-    )
+# ---------------------------------------------
+# Генерация ответа через OpenAI
+# ---------------------------------------------
+def generate_answer(chat_id, user_message):
+    # Загружаем историю
+    history = load_history(chat_id)
+
+    # Формируем список сообщений
+    messages = [{"role": "system", "content": (
+        "Ты — миграционный консультант компании Global Relocation Solutions. "
+        "Отвечай профессионально, лаконично и по делу. "
+        "Если вопрос связан с законами или программами, используй актуальные данные из интернета. "
+        "Когда уместно, можешь упомянуть наш сайт globalrelocationsolutions.com."
+    )}]
+
+    for row in history:
+        messages.append({"role": row["role"], "content": row["content"]})
+
+    messages.append({"role": "user", "content": user_message})
+
+    # Попробуем поискать в Tavily
+    tavily_info = tavily_search(user_message)
+    if tavily_info:
+        messages.append({"role": "system", "content": f"Актуальная информация из поиска:\n{tavily_info}"})
 
     try:
-        # Первый запрос
         response = client.chat.completions.create(
             model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "web_search",
-                        "description": "Поиск свежей информации в интернете",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string"}
-                            },
-                            "required": ["query"],
-                        },
-                    }
-                }
-            ],
-            tool_choice="auto",
-            max_completion_tokens=800,
+            messages=messages,
+            max_completion_tokens=800
         )
-
-        choice = response.choices[0]
-
-        # Если модель решила вызвать web_search
-        if choice.message.tool_calls:
-            for tool_call in choice.message.tool_calls:
-                if tool_call.function.name == "web_search":
-                    args = json.loads(tool_call.function.arguments)
-                    query = args.get("query")
-                    search_result = web_search(query)
-
-                    # Второй запрос — модель получает результаты поиска
-                    response = client.chat.completions.create(
-                        model="gpt-4.1",
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_text},
-                            choice.message,
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": search_result,
-                            },
-                        ],
-                        max_completion_tokens=1000,
-                    )
-
-        reply_text = response.choices[0].message.content.strip()
-        if not reply_text:
-            reply_text = "Извините, я не нашёл ответа."
-
+        answer = response.choices[0].message.content.strip()
+        return answer
     except Exception as e:
-        log.error(f"Ошибка OpenAI: {e}")
-        reply_text = "Извините, произошла ошибка."
+        logger.error(f"Ошибка OpenAI: {e}")
+        return "Извините, я не смог сгенерировать ответ."
 
-    send_message(chat_id, reply_text)
+# ---------------------------------------------
+# Telegram webhook
+# ---------------------------------------------
+@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    logger.info(f"Update: {data}")
+
+    if "message" in data and "text" in data["message"]:
+        chat_id = data["message"]["chat"]["id"]
+        user_message = data["message"]["text"]
+
+        save_message(chat_id, "user", user_message)
+        answer = generate_answer(chat_id, user_message)
+        save_message(chat_id, "assistant", answer)
+
+        send_message(chat_id, answer)
+
     return "ok"
 
-# ----------------------------------------
-# 🚀 Локальный запуск
-# ----------------------------------------
+# ---------------------------------------------
+# Функция отправки ответа в Telegram
+# ---------------------------------------------
+def send_message(chat_id, text):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        resp = requests.post(url, json=payload)
+        logger.info(f"Отправлено сообщение длиной {len(text)} символов")
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+
+# ---------------------------------------------
+# Точка входа
+# ---------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    init_db()  # инициализация базы при запуске
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
