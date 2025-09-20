@@ -180,5 +180,4 @@ def send_message(chat_id, text):
 # Точка входа
 # ---------------------------------------------
 if __name__ == "__main__":
-    init_db()  # инициализация базы при запуске
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
