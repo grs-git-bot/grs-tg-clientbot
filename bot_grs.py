@@ -145,7 +145,7 @@ def generate_answer(chat_id, user_message):
         return "Извините, я не смог сгенерировать ответ."
 
 # ---------------------------------------------
-# Telegram webhook
+# Telegram webhook (с учётом reply_to_message)
 # ---------------------------------------------
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
@@ -156,14 +156,25 @@ def webhook():
         chat_id = data["message"]["chat"]["id"]
         user_message = data["message"]["text"]
 
+        # Проверяем, было ли это reply на другое сообщение
+        if "reply_to_message" in data["message"]:
+            original_text = data["message"]["reply_to_message"].get("text", "")
+            if original_text:
+                user_message = f"(Ответ на сообщение: '{original_text}') {user_message}"
+
+        # Сохраняем сообщение пользователя
         save_message(chat_id, "user", user_message)
+
+        # Генерируем ответ
         answer = generate_answer(chat_id, user_message)
+
+        # Сохраняем ответ ассистента
         save_message(chat_id, "assistant", answer)
 
+        # Отправляем ответ в Telegram
         send_message(chat_id, answer)
 
     return "ok"
-
 # ---------------------------------------------
 # Функция отправки ответа в Telegram
 # ---------------------------------------------
