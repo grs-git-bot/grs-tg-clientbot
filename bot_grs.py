@@ -116,9 +116,8 @@ def generate_answer(chat_id, user_message):
     history = load_history(chat_id)
 
     # Формируем список сообщений
- messages = [{
-    "role": "system",
-    "content": """Ты — миграционный консультант компании Global Relocation Solutions.
+    messages = [{"role": "system", "content": (
+        """Ты — миграционный консультант компании Global Relocation Solutions.
 
 Правила ответов:
 1. Отвечай кратко и структурировано (2–5 предложений).
@@ -126,7 +125,7 @@ def generate_answer(chat_id, user_message):
 3. Избегай двусмысленных формулировок. Пиши так, чтобы ответ был однозначным.
 4. Если вопрос связан с законодательством, указывай источник информации.
 5. Если вопрос выходит за рамки миграции — отвечай вежливо и перенаправляй."""
-}]
+    )}]
 
     for row in history:
         messages.append({"role": row["role"], "content": row["content"]})
